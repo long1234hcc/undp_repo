@@ -40,7 +40,7 @@ for lat in lat_centers:
             "lon_center": round(float(lon), 1),
             "lat_edge_south": round(float(lat - STEP/2), 1),
             "lat_edge_north": round(float(lat + STEP/2), 1),
-            "lon_edge_west":  round(float(lon - STEP/2), 1),
+            "lon_edge_west":  round(floaWt(lon - STEP/2), 1),
             "lon_edge_east":  round(float(lon + STEP/2), 1),
         })
 

@@ -363,7 +363,7 @@ export default function App() {
 
   // Tính cell size dựa trên zoom để ô grid vừa khít không bị gap, không overlap
   // Giả sử data là lưới 1°×1°, ta tính pixel size tương ứng
-  const GRID_RESOLUTION_DEG = 1.0; // độ phân giải lưới (thay đổi nếu cần)
+  const GRID_RESOLUTION_DEG = 0.5; // độ phân giải lưới (thay đổi nếu cần)
 
   const layers = [
     // ── Lớp 1: PolygonLayer hiển thị các ô grid đất liền ──
@@ -371,14 +371,12 @@ export default function App() {
       id: 'risk-grid',
       data,
       pickable: true,
-      stroked: false,        // Không border để blend mượt với nhau
+      stroked: false,
       filled: true,
-      extruded: false,
-
-      // Mỗi điểm (lon, lat) là tâm ô 1°×1°
-      // half = 0.5° để 4 góc tạo thành ô vuông
+      
       getPolygon: d => {
-        const half = GRID_RESOLUTION_DEG / 2;
+        const OVERLAP = 1.002; // ← thêm dòng này: phóng to ô 0.2% để che gap
+        const half = (GRID_RESOLUTION_DEG / 2) * OVERLAP;
         const lon = parseFloat(d.lon);
         const lat = parseFloat(d.lat);
         return [

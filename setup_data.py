@@ -28,9 +28,12 @@ Changelog:
                           bị PostgreSQL TIMESTAMPTZ hiểu sai múi giờ (+7h offset)
   [FIX-8] fetch_batch   : lat/lon truyền dạng comma-separated string đúng chuẩn
                           Open-Meteo doc, tránh lỗi 414 URI Too Long với list-of-tuples
-  [FIX-10] fetch_batch   : Exponential backoff + retry khi gặp 429 Too Many Requests.
+  [FIX-10] fetch_batch  : Exponential backoff + retry khi gặp 429 Too Many Requests.
                           Đọc Retry-After header nếu có, fallback về jitter backoff.
                           Batch thực sự lỗi (5xx, timeout) mới bị skip.
+  [FIX-11] assign_polygon_to_observations:
+                          polygon_geom = ST_AsGeoJSON(ap.geom) thay vì ap.geom
+                          → lưu GeoJSON string (TEXT) thay vì raw geometry.
 ────────────────────────────────────────────────────────────────
 """
 
@@ -53,7 +56,7 @@ log = logging.getLogger(__name__)
 # ── Config ────────────────────────────────────────────────────
 DB_CONFIG = {
     "host":     os.getenv("DB_HOST", "localhost"),
-    "port":     int(os.getenv("DB_PORT", 5432)),
+    "port":     int(os.getenv("DB_PORT", 5433)),
     "dbname":   os.getenv("DB_NAME", "undp_db"),
     "user":     os.getenv("DB_USER", "admin"),
     "password": os.getenv("DB_PASSWORD", "secretpassword"),
@@ -62,18 +65,24 @@ DB_CONFIG = {
 # Bounding box Đông Nam Á
 LAT_MIN, LAT_MAX = -10.0, 28.0
 LON_MIN, LON_MAX =  95.0, 141.0
-STEP = 1.0
+
+# LAT_MIN, LAT_MAX = 10.0, 12.0   
+# LON_MIN, LON_MAX = 105.0, 107.0  
+
+# LAT_MIN, LAT_MAX = 10.0, 16.0
+# LON_MIN, LON_MAX = 107.0, 115.0
+
+STEP = 0.1
 
 # Khoảng thời gian lấy data
-START_DATE = "2026-04-01"
-END_DATE   = "2026-04-07"
+START_DATE = "2025-12-31"
+END_DATE   = "2025-12-31"
 
 # Số điểm mỗi batch — Open-Meteo khuyến nghị ≤ 50
 BATCH_SIZE = 50
 
-# Free tier Open-Meteo: ~10 req/phút → cần ≥ 6s giữa các request
-# 35 batch × 6s ≈ 3.5 phút tổng
-REQUEST_DELAY = 6.0
+HOURLY_CALL_LIMIT = 4800
+REQUEST_DELAY = 8
 
 API_URL = "https://archive-api.open-meteo.com/v1/archive"
 
@@ -82,26 +91,14 @@ API_URL = "https://archive-api.open-meteo.com/v1/archive"
 # Bước 1: Tạo grid points
 # ═══════════════════════════════════════════════════════════════
 def generate_grid() -> list[dict]:
-    """
-    Tạo danh sách các ô grid 1°x1° bao phủ bounding box ĐNA.
-
-    Dùng index * STEP thay vì np.arange() + offset để tránh
-    floating-point accumulation drift qua nhiều phép cộng liên tiếp.
-    Kết quả: tâm ô luôn là X.5 (e.g. -9.5, -8.5, ..., 27.5).
-
-    FIX-5: Tính lat/lon từ index thay vì arange để tránh float drift.
-    """
     n_lat = int(round((LAT_MAX - LAT_MIN) / STEP))
     n_lon = int(round((LON_MAX - LON_MIN) / STEP))
 
     points = []
     for i in range(n_lat):
         for j in range(n_lon):
-            # Tâm ô = cạnh dưới/trái + nửa bước
             lat = LAT_MIN + i * STEP + STEP / 2
             lon = LON_MIN + j * STEP + STEP / 2
-
-            # Round 6 chữ số: đủ chính xác, loại bỏ noise float 64-bit
             lat = round(lat, 6)
             lon = round(lon, 6)
 
@@ -122,10 +119,6 @@ def generate_grid() -> list[dict]:
 # Bước 2: Gọi API theo batch
 # ═══════════════════════════════════════════════════════════════
 def fetch_batch(batch_points: list[dict]) -> list[dict]:
-    """
-    Gọi Open-Meteo Archive API cho 1 batch (tối đa BATCH_SIZE điểm).
-    Trả về list of response objects theo đúng thứ tự batch_points.
-    """
     lats = ",".join(str(p["lat_center"]) for p in batch_points)
     lons = ",".join(str(p["lon_center"]) for p in batch_points)
 
@@ -156,24 +149,9 @@ def parse_response(
     api_response_list: list[dict],
     batch_points: list[dict],
 ) -> list[tuple]:
-    """
-    Chuyển list response objects từ API thành list rows để INSERT.
-
-    Mỗi row: (lat_center, lon_center, observed_at, temperature_2m, relative_humidity_2m)
-
-    FIX-9: Bỏ Euclidean nearest-neighbor O(N) — thay bằng zip(batch_points, response).
-           Open-Meteo đảm bảo response list có cùng thứ tự và độ dài với
-           mảng tọa độ đầu vào → map trực tiếp, O(1) mỗi điểm.
-           Vẫn log warning nếu độ dài không khớp để phát hiện API thay đổi.
-
-    FIX-4: datetime.fromisoformat(t).replace(tzinfo=timezone.utc) → aware datetime.
-           Kết hợp FIX-7 (timezone=UTC từ API), chuỗi "2026-04-01T00:00" là UTC thực sự.
-           replace(tzinfo=utc) biến naive → aware để psycopg2 insert TIMESTAMPTZ đúng.
-    """
     rows: list[tuple] = []
     skipped = 0
 
-    # Kiểm tra độ dài khớp — bảo vệ nếu API thay đổi hành vi
     if len(api_response_list) != len(batch_points):
         log.warning(
             f"  [Parse] Mismatch: API trả {len(api_response_list)} objects "
@@ -181,7 +159,7 @@ def parse_response(
         )
         return rows
 
-    for grid_point, obj in zip(batch_points, api_response_list):  # FIX-9
+    for grid_point, obj in zip(batch_points, api_response_list):
         matched_lat = grid_point["lat_center"]
         matched_lon = grid_point["lon_center"]
 
@@ -195,7 +173,6 @@ def parse_response(
             continue
 
         for t, temp, hum in zip(times, temps, humidities):
-            # FIX-4 + FIX-7: parse naive string UTC → aware datetime UTC
             observed_at = datetime.fromisoformat(t).replace(tzinfo=timezone.utc)
             rows.append((
                 matched_lat,
@@ -211,14 +188,90 @@ def parse_response(
     return rows
 
 
+def assign_polygon_to_observations(conn: psycopg2.extensions.connection) -> None:
+    """
+    Pass 3: Gán gid_1 + polygon_geom vào weather_observations.
+
+    Dùng PostGIS ST_Contains để map từng grid point → tỉnh tương ứng.
+    [FIX-11] ST_AsGeoJSON(ap.geom) thay vì ap.geom → lưu GeoJSON string (TEXT).
+
+    Các điểm trên biển → gid_1 = NULL, polygon_geom = NULL.
+    """
+    log.info("[DB] Pass 3 — Gán gid_1 + polygon_geom ...")
+
+    with conn.cursor() as cur:
+        # ── Step 3a: Gán gid_1 cho grid_points trước ─────────
+        cur.execute("""
+            UPDATE grid_points gp
+            SET gid_1 = ap.gid_1
+            FROM admin_polygons ap
+            WHERE ST_Contains(
+                ap.geom,
+                ST_SetSRID(ST_Point(gp.lon_center, gp.lat_center), 4326)
+            )
+        """)
+        gp_updated = cur.rowcount
+        log.info(f"  [3a] {gp_updated:,} grid_points được gán gid_1")
+
+    conn.commit()
+
+    with conn.cursor() as cur:
+        # ── Step 3b: Propagate gid_1 + polygon_geom → weather_observations ──
+        # [FIX-11] ST_AsGeoJSON → TEXT thay vì raw geometry
+        # [FIX-12] ST_NumGeometries = 1 → extract Polygon đơn thay vì MultiPolygon
+        cur.execute("""
+            UPDATE weather_observations wo
+            SET
+                gid_1        = ap.gid_1,
+                polygon_geom = ST_AsGeoJSON(
+                    CASE
+                        WHEN ST_NumGeometries(ap.geom) = 1 THEN ST_GeometryN(ap.geom, 1)
+                        ELSE ap.geom
+                    END
+                )
+            FROM grid_points gp
+            JOIN admin_polygons ap ON gp.gid_1 = ap.gid_1
+            WHERE wo.lat_center = gp.lat_center
+              AND wo.lon_center = gp.lon_center
+        """)
+        wo_updated = cur.rowcount
+        log.info(f"  [3b] {wo_updated:,} weather_observations được gán gid_1 + polygon_geom")
+
+    conn.commit()
+
+    # ── Verify ────────────────────────────────────────────────
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT COUNT(*) FROM weather_observations WHERE gid_1 IS NOT NULL
+        """)
+        with_polygon = cur.fetchone()[0]
+
+        cur.execute("""
+            SELECT COUNT(*) FROM weather_observations WHERE gid_1 IS NULL
+        """)
+        ocean_points = cur.fetchone()[0]
+
+        cur.execute("""
+            SELECT ap.country_code, COUNT(DISTINCT gp.gid_1) as provinces
+            FROM grid_points gp
+            JOIN admin_polygons ap ON gp.gid_1 = ap.gid_1
+            GROUP BY ap.country_code
+            ORDER BY ap.country_code
+        """)
+        by_country = cur.fetchall()
+
+    log.info(f"  [Verify] {with_polygon:,} rows có polygon  |  {ocean_points:,} rows trên biển (NULL)")
+    log.info("  [Verify] Phân bổ theo quốc gia:")
+    for code, n in by_country:
+        log.info(f"    {code:<6} {n:>3} provinces có data")
+
+    log.info("[DB] Pass 3 hoàn tất")
+
+
 # ═══════════════════════════════════════════════════════════════
 # Bước 4: Insert vào PostgreSQL
 # ═══════════════════════════════════════════════════════════════
 def insert_grid_points(conn: psycopg2.extensions.connection, grid_points: list[dict]) -> None:
-    """
-    Upsert tất cả grid points vào bảng grid_points.
-    ON CONFLICT DO NOTHING → an toàn khi chạy lại nhiều lần.
-    """
     rows = [
         (
             p["lat_center"], p["lon_center"],
@@ -250,13 +303,6 @@ def insert_observations(
     conn: psycopg2.extensions.connection,
     rows: list[tuple],
 ) -> None:
-    """
-    Bulk-insert weather observations.
-    temp_nor / hum_nor để NULL lúc insert — sẽ được điền sau bằng
-    normalize_observations() khi toàn bộ data đã vào DB, vì Min-Max
-    cần biết global min/max của toàn dataset mới tính được chính xác.
-    ON CONFLICT DO NOTHING → idempotent nếu chạy lại.
-    """
     if not rows:
         return
 
@@ -278,19 +324,11 @@ def insert_observations(
 
 def normalize_observations(conn: psycopg2.extensions.connection) -> None:
     """
-    Pass 2: Điền temp_nor và hum_nor bằng Min-Max Normalization.
-
-    Chạy 1 câu UPDATE duy nhất sau khi toàn bộ data đã insert xong.
-    PostgreSQL xử lý hoàn toàn server-side — không tốn RAM Python,
-    không cần load 2M rows lên memory.
-
-    Công thức:  norm = (x - min) / (max - min)  →  kết quả trong [0.0, 1.0]
-    NULLIF tránh chia-cho-0 trong trường hợp toàn bộ giá trị bằng nhau.
+    Pass 2: Điền temp_nor và humidity_nor bằng Min-Max Normalization.
     """
     log.info("[DB] Pass 2 — Tính Min-Max normalization ...")
 
     with conn.cursor() as cur:
-        # Lấy min/max thực tế của dataset trước để log ra kiểm tra
         cur.execute("""
             SELECT
                 MIN(temperature_2m),  MAX(temperature_2m),
@@ -301,13 +339,12 @@ def normalize_observations(conn: psycopg2.extensions.connection) -> None:
         log.info(f"  temp     : [{min_t:.2f}°C → {max_t:.2f}°C]")
         log.info(f"  humidity : [{min_h:.1f}% → {max_h:.1f}%]")
 
-        # UPDATE toàn bộ bảng trong 1 query — PostgreSQL tự tối ưu
         cur.execute("""
             UPDATE weather_observations
             SET
                 temp_nor = (temperature_2m       - stats.min_t)
                            / NULLIF(stats.max_t  - stats.min_t, 0),
-                hum_nor  = (relative_humidity_2m - stats.min_h)
+                humidity_nor  = (relative_humidity_2m - stats.min_h)
                            / NULLIF(stats.max_h  - stats.min_h, 0)
             FROM (
                 SELECT
@@ -320,7 +357,7 @@ def normalize_observations(conn: psycopg2.extensions.connection) -> None:
         """)
         updated = cur.rowcount
     conn.commit()
-    log.info(f"[DB] Normalized {updated:,} rows → temp_nor, hum_nor sẵn sàng")
+    log.info(f"[DB] Normalized {updated:,} rows → temp_nor, humidity_nor sẵn sàng")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -336,7 +373,6 @@ def main() -> None:
     # ── 1. Tạo grid ─────────────────────────────────────────
     grid_points = generate_grid()
 
-    # Số giờ kỳ vọng = 7 ngày × 24h = 168
     hours_expected = (
         (datetime.fromisoformat(END_DATE) - datetime.fromisoformat(START_DATE)).days + 1
     ) * 24
@@ -349,7 +385,6 @@ def main() -> None:
     log.info("[DB] Kết nối thành công")
 
     # ── 3. TRUNCATE + Insert grid points ────────────────────────
-    # Truncate để chạy lại từ đầu, tránh data thừa từ lần trước
     with conn.cursor() as cur:
         log.info("[DB] Truncating tables ...")
         cur.execute("TRUNCATE TABLE weather_observations, grid_points RESTART IDENTITY CASCADE")
@@ -363,10 +398,24 @@ def main() -> None:
 
     total_rows   = 0
     failed_batch = 0
+    calls_this_hour = 0
+    hour_start      = time.time()
 
     for i in range(0, len(grid_points), BATCH_SIZE):
         batch     = grid_points[i : i + BATCH_SIZE]
         batch_num = i // BATCH_SIZE + 1
+
+        # ── Hourly rate limit guard ──────────────────────────
+        if calls_this_hour + len(batch) > HOURLY_CALL_LIMIT:
+            elapsed    = time.time() - hour_start
+            sleep_time = max(3600 - elapsed + 15, 0)
+            log.info(
+                f"[RateLimit] {calls_this_hour} calls trong giờ này "
+                f"→ nghỉ {sleep_time:.0f}s đến giờ mới"
+            )
+            time.sleep(sleep_time)
+            calls_this_hour = 0
+            hour_start      = time.time()
 
         log.info(f"  Batch {batch_num:03d}/{n_batches} — {len(batch)} điểm ...")
 
@@ -395,7 +444,6 @@ def main() -> None:
             continue
 
         finally:
-            # Delay sau mỗi batch thành công — giữ trong giới hạn free tier
             time.sleep(REQUEST_DELAY)
 
     # ── 5. Summary ───────────────────────────────────────────
@@ -406,6 +454,9 @@ def main() -> None:
 
     # ── 6. Pass 2: Normalization ─────────────────────────────
     normalize_observations(conn)
+
+    # ── 6. Pass 3: Assign polygon ─────────────────────────────
+    assign_polygon_to_observations(conn)
 
     # ── 7. Verify DB ─────────────────────────────────────────
     with conn.cursor() as cur:
@@ -419,11 +470,10 @@ def main() -> None:
         row = cur.fetchone()
         min_t, max_t = row if row else (None, None)
 
-        # Kiểm tra norm columns: min phải ~0, max phải ~1
         cur.execute("""
             SELECT
                 ROUND(MIN(temp_nor)::numeric, 4), ROUND(MAX(temp_nor)::numeric, 4),
-                ROUND(MIN(hum_nor)::numeric,  4), ROUND(MAX(hum_nor)::numeric,  4)
+                ROUND(MIN(humidity_nor)::numeric,  4), ROUND(MAX(humidity_nor)::numeric,  4)
             FROM weather_observations
         """)
         nt_min, nt_max, nh_min, nh_max = cur.fetchone()
@@ -434,7 +484,7 @@ def main() -> None:
     log.info(f"  weather_observations : {obs_count:,} rows")
     log.info(f"  Time range           : {min_t} → {max_t}")
     log.info(f"  temp_nor             : [{nt_min} → {nt_max}]  (kỳ vọng 0.0 → 1.0)")
-    log.info(f"  hum_nor              : [{nh_min} → {nh_max}]  (kỳ vọng 0.0 → 1.0)")
+    log.info(f"  humidity_nor         : [{nh_min} → {nh_max}]  (kỳ vọng 0.0 → 1.0)")
 
     conn.close()
     log.info("[DB] Connection closed. Done!")
