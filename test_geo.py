@@ -5,7 +5,7 @@ from shapely.geometry import shape
 import folium
 
 # 1. Đọc dữ liệu của bạn (Giả sử bạn đang load từ DB hoặc CSV)
-df = pd.read_json('json_undp_2.json', orient='records')
+df = pd.read_json('result_test.json', orient='records')
 # Ở đây mình giả lập dataframe dựa trên cấu trúc bạn cung cấp
 # df = pd.DataFrame({...})
 
@@ -45,9 +45,14 @@ def visualize_map_coverage(df):
     m = folium.Map(location=[15.0, 105.0], zoom_start=5, tiles="CartoDB positron")
 
     # Cấu hình hiển thị tooltip
+    # tooltip = folium.GeoJsonTooltip(
+    #     fields=['gid_1', 'province_name', 'country_name', 'observed_at'], # Thêm observed_at vào tooltip để check
+    #     aliases=['ID:', 'Province:', 'Country:', 'Time:'],
+    #     localize=True
+    # )
     tooltip = folium.GeoJsonTooltip(
-        fields=['gid_1', 'province_name', 'country_name', 'observed_at'], # Thêm observed_at vào tooltip để check
-        aliases=['ID:', 'Province:', 'Country:', 'Time:'],
+        fields=['gid_1', 'country_name', 'observed_at', 'temperature_2m', 'relative_humidity_2m'],
+        aliases=['GID:', 'Country:', 'Time:', 'Temp (°C):', 'Humidity (%):'],
         localize=True
     )
 
