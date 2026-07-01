@@ -44,6 +44,11 @@ from psycopg2.extras import execute_values
 from datetime import date, timedelta
 from collections import defaultdict
 
+
+import json
+import re
+
+
 # ── Logging ─────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -160,6 +165,8 @@ def ensure_table(conn: psycopg2.extensions.connection) -> None:
                 gid_2                 TEXT,
                 lat_center            NUMERIC,
                 lon_center            NUMERIC,
+                district_name         TEXT,        
+                province_name         TEXT,        
                 forecast_run_date     DATE,
                 forecast_date         DATE,
                 temperature_2m        NUMERIC,
@@ -169,7 +176,7 @@ def ensure_table(conn: psycopg2.extensions.connection) -> None:
                 population            NUMERIC,
                 density               NUMERIC,
                 percen_previous       NUMERIC,
-                geom                  GEOMETRY,
+                geom                  TEXT,
                 UNIQUE (gid_2, forecast_date, forecast_run_date)
             );
         """)
@@ -222,7 +229,7 @@ def insert_alerts(
             cur,
             """
             INSERT INTO weather_alerts
-                (gid_1, gid_2, lat_center, lon_center,
+                (gid_1, gid_2, lat_center, lon_center,district_name, province_name,
                  forecast_run_date, forecast_date,
                  temperature_2m, relative_humidity_2m,
                  heat_index, alert_level,
@@ -232,6 +239,8 @@ def insert_alerts(
             DO UPDATE SET
                 temperature_2m       = EXCLUDED.temperature_2m,
                 relative_humidity_2m = EXCLUDED.relative_humidity_2m,
+                district_name        = EXCLUDED.district_name,
+                province_name        = EXCLUDED.province_name,
                 heat_index           = EXCLUDED.heat_index,
                 alert_level          = EXCLUDED.alert_level,
                 population           = EXCLUDED.population,
@@ -244,6 +253,57 @@ def insert_alerts(
         )
     conn.commit()
 
+
+# ════════════════════════════════════════════════════════════════════
+# HELPER: TRANSFORM POLYGONS
+# ════════════════════════════════════════════════════════════════════
+
+
+def wkt_to_geojson(wkt: str) -> str | None:
+    """
+    Convert WKT string (từ ST_AsText) → GeoJSON string.
+    
+    - POLYGON((...))            → {"type":"Polygon","coordinates":[[[...]]]}
+    - MULTIPOLYGON với 1 ring   → {"type":"Polygon","coordinates":[[[...]]]}
+    - MULTIPOLYGON với nhiều ring → {"type":"MultiPolygon","coordinates":[[[[...]]]]}
+    """
+    if not wkt:
+        return None
+
+    wkt = wkt.strip()
+
+    def parse_ring(ring_str: str) -> list:
+        """Parse '101.39 13.60,101.38 13.59,...' → [[101.39,13.60],...]"""
+        coords = []
+        for pair in ring_str.strip().split(","):
+            parts = pair.strip().split()
+            if len(parts) == 2:
+                coords.append([float(parts[0]), float(parts[1])])
+        return coords
+
+    if wkt.startswith("POLYGON"):
+        # POLYGON((x y, x y, ...))
+        inner = re.findall(r"\(([^()]+)\)", wkt)
+        rings = [parse_ring(r) for r in inner]
+        return json.dumps({"type": "Polygon", "coordinates": rings})
+
+    elif wkt.startswith("MULTIPOLYGON"):
+        # MULTIPOLYGON(((x y,...),(x y,...)),((x y,...)))
+        # Tách từng polygon: mỗi ((...)) là 1 polygon
+        polygons_raw = re.findall(r"\((\([^)]+\)(?:,\([^)]+\))*)\)", wkt)
+        polygons = []
+        for poly_str in polygons_raw:
+            rings_raw = re.findall(r"\(([^()]+)\)", poly_str)
+            rings = [parse_ring(r) for r in rings_raw]
+            polygons.append(rings)
+
+        if len(polygons) == 1:
+            # Chỉ 1 polygon → trả về Polygon
+            return json.dumps({"type": "Polygon", "coordinates": polygons[0]})
+        else:
+            return json.dumps({"type": "MultiPolygon", "coordinates": polygons})
+
+    return None
 
 # ════════════════════════════════════════════════════════════════════
 # STAGE 1 — FETCH + COMPUTE + INSERT
@@ -275,7 +335,7 @@ def get_district_centroids(conn: psycopg2.extensions.connection) -> list[dict]:
             "province_name": r[3],
             "lat_center":    float(r[4]),
             "lon_center":    float(r[5]),
-            "geom":          r[6],
+            "geom":           wkt_to_geojson(r[6]),
         }
         for r in rows
     ]
@@ -372,6 +432,8 @@ def parse_and_enrich_batch(
                 "lat_center":          point["lat_center"],
                 "lon_center":          point["lon_center"],
                 "geom":                point["geom"],
+                "district_name":       point["district_name"],  
+                "province_name":       point["province_name"],   
                 "forecast_date":       date.fromisoformat(t_str),
                 "temperature_2m":      temp_mean,
                 "relative_humidity_2m": hum_mean,
@@ -399,16 +461,18 @@ def parse_and_enrich_batch(
                 rec["gid_2"],
                 rec["lat_center"],
                 rec["lon_center"],
-                run_date,                    # forecast_run_date
-                rec["forecast_date"],        # forecast_date
+                rec["district_name"],          # ← đúng vị trí
+                rec["province_name"],          # ← đúng vị trí
+                run_date,                      # forecast_run_date
+                rec["forecast_date"],
                 rec["temperature_2m"],
                 rec["relative_humidity_2m"],
                 rec["heat_index"],
                 rec["alert_level"],
                 rec["population"],
                 rec["density"],
-                percen,   # percen_previous                                 
-                rec["geom"],                 # geom
+                percen,
+                rec["geom"],
             ))
 
     return rows
